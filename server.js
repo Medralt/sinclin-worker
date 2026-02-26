@@ -1,18 +1,6 @@
-import express from "express";
-import { createClient } from "@supabase/supabase-js";
-import { createRemoteJWKSet, jwtVerify } from "jose";
-
-/**
- * Helpers
- */
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v || String(v).trim() === "") {
-    throw new Error(`Missing env var: ${name}`);
-  }
-  return v;
 /**
  * sinclin-worker (Cloud Run)
+ * - Does NOT crash on startup if ENV/Secrets are missing
  * - Validates Supabase JWT via JWKS
  * - Creates signed URL for Supabase Storage object
  * - Returns { ok: true, signedUrl } when gateway is disabled
@@ -23,14 +11,7 @@ import express from "express";
 import { createClient } from "@supabase/supabase-js";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 
-// Node 18+ on Cloud Run has global fetch
-
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
-}
-
+// -------- helpers --------
 function jsonError(res, status, message, extra = undefined) {
   return res.status(status).json({
     ok: false,
@@ -39,54 +20,80 @@ function jsonError(res, status, message, extra = undefined) {
   });
 }
 
-/**
- * Required ENV (from Cloud Run Secrets)
- */
-const SUPABASE_URL = mustEnv("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
+function isTruthyFlag(v) {
+  return /^(1|true|yes|on)$/i.test((v || "").trim());
+}
 
-/**
- * Gateway (optional)
- * Default: disabled
- * Enable only if LOVABLE_AI_GATEWAY_ENABLED=true (or 1/yes/on)
- */
-const LOVABLE_AI_GATEWAY_URL = (process.env.LOVABLE_AI_GATEWAY_URL || "").trim();
-const LOVABLE_AI_GATEWAY_ENABLED = /^(1|true|yes|on)$/i.test(
-  (process.env.LOVABLE_AI_GATEWAY_ENABLED || "").trim()
-);
-const LOVABLE_AI_GATEWAY_KEY = process.env.LOVABLE_AI_GATEWAY_KEY;
-
-function getValidGatewayBaseUrl() {
-  if (!LOVABLE_AI_GATEWAY_URL) return "";
-  if (LOVABLE_AI_GATEWAY_URL.includes("example.com")) return "";
+function getValidUrlOrEmpty(s) {
+  const v = (s || "").trim();
+  if (!v) return "";
+  if (v.includes("example.com")) return "";
   try {
-    // valida formato
-    new URL(LOVABLE_AI_GATEWAY_URL);
-    return LOVABLE_AI_GATEWAY_URL;
+    new URL(v);
+    return v;
   } catch {
     return "";
   }
 }
 
-function shouldCallGateway() {
-  const base = getValidGatewayBaseUrl();
-  return LOVABLE_AI_GATEWAY_ENABLED && !!base;
+// -------- lazy runtime config (prevents startup crash) --------
+let cached = {
+  supabaseUrl: null,
+  serviceRoleKey: null,
+  expectedIssuer: null,
+  expectedAudience: null,
+  jwksUrl: null,
+  JWKS: null,
+  supabaseAdmin: null,
+};
+
+function loadRuntimeConfig() {
+  const SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+  const SUPABASE_SERVICE_ROLE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    return {
+      ok: false,
+      missing: [
+        !SUPABASE_URL ? "SUPABASE_URL" : null,
+        !SUPABASE_SERVICE_ROLE_KEY ? "SUPABASE_SERVICE_ROLE_KEY" : null,
+      ].filter(Boolean),
+    };
+  }
+
+  // If unchanged, reuse cached clients/urls
+  if (
+    cached.supabaseUrl === SUPABASE_URL &&
+    cached.serviceRoleKey === SUPABASE_SERVICE_ROLE_KEY &&
+    cached.JWKS &&
+    cached.supabaseAdmin
+  ) {
+    return { ok: true, ...cached };
+  }
+
+  const expectedIssuer = new URL("/auth/v1", SUPABASE_URL).toString().replace(/\/$/, "");
+  const expectedAudience = process.env.SUPABASE_JWT_AUD || "authenticated";
+  const jwksUrl = new URL("/auth/v1/.well-known/jwks.json", SUPABASE_URL);
+  const JWKS = createRemoteJWKSet(jwksUrl);
+
+  const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+
+  cached = {
+    supabaseUrl: SUPABASE_URL,
+    serviceRoleKey: SUPABASE_SERVICE_ROLE_KEY,
+    expectedIssuer,
+    expectedAudience,
+    jwksUrl,
+    JWKS,
+    supabaseAdmin,
+  };
+
+  return { ok: true, ...cached };
 }
 
-// JWT validation settings
-const expectedIssuer = new URL("/auth/v1", SUPABASE_URL).toString().replace(/\/$/, "");
-const expectedAudience = process.env.SUPABASE_JWT_AUD || "authenticated";
-
-// JWKS endpoint do Supabase Auth
-const jwksUrl = new URL("/auth/v1/.well-known/jwks.json", SUPABASE_URL);
-const JWKS = createRemoteJWKSet(jwksUrl);
-
-// Supabase admin (service role) — apenas backend
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
-
-async function requireSupabaseJWT(req) {
+async function requireSupabaseJWT(req, cfg) {
   const h = req.headers.authorization || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : null;
 
@@ -97,9 +104,9 @@ async function requireSupabaseJWT(req) {
   }
 
   try {
-    const { payload } = await jwtVerify(token, JWKS, {
-      issuer: expectedIssuer,
-      audience: expectedAudience,
+    const { payload } = await jwtVerify(token, cfg.JWKS, {
+      issuer: cfg.expectedIssuer,
+      audience: cfg.expectedAudience,
     });
     return payload;
   } catch {
@@ -109,29 +116,35 @@ async function requireSupabaseJWT(req) {
   }
 }
 
-/**
- * App
- */
+// -------- app --------
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (req, res) => res.status(200).send("sinclin-worker ok"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-/**
- * POST /transcribe
- */
+app.get("/health", (req, res) => {
+  const cfg = loadRuntimeConfig();
+  if (!cfg.ok) {
+    return res.status(500).json({ ok: false, missing_env: cfg.missing });
+  }
+  return res.status(200).json({ ok: true });
+});
+
 app.post("/transcribe", async (req, res) => {
   try {
-    const jwt = await requireSupabaseJWT(req);
+    const cfg = loadRuntimeConfig();
+    if (!cfg.ok) {
+      return jsonError(res, 500, "Missing required env", { missing_env: cfg.missing });
+    }
+
+    const jwt = await requireSupabaseJWT(req, cfg);
     const userId = jwt?.sub;
 
     if (!userId) {
       return jsonError(res, 401, "JWT missing sub (user id)");
     }
 
-    const { transcription_request_id, storage_bucket, storage_path, mime_type } =
-      req.body || {};
+    const { transcription_request_id, storage_bucket, storage_path, mime_type } = req.body || {};
 
     if (!transcription_request_id || !storage_bucket || !storage_path || !mime_type) {
       return jsonError(res, 400, "Missing required fields", {
@@ -140,7 +153,7 @@ app.post("/transcribe", async (req, res) => {
     }
 
     // 1) Signed URL do Storage
-    const { data: signed, error: signErr } = await supabaseAdmin.storage
+    const { data: signed, error: signErr } = await cfg.supabaseAdmin.storage
       .from(storage_bucket)
       .createSignedUrl(storage_path, 60 * 60);
 
@@ -151,7 +164,7 @@ app.post("/transcribe", async (req, res) => {
 
     // 2) Opcional: marcar status no DB
     try {
-      await supabaseAdmin.from("transcription_requests").upsert({
+      await cfg.supabaseAdmin.from("transcription_requests").upsert({
         id: transcription_request_id,
         user_id: userId,
         status: "processing",
@@ -162,22 +175,21 @@ app.post("/transcribe", async (req, res) => {
       console.warn("DB upsert skipped/failed:", dbErr?.message || dbErr);
     }
 
-    // ✅ 3) Se gateway estiver DESLIGADO, retorna agora (objetivo do teste)
-    if (!shouldCallGateway()) {
-      return res.status(200).json({
-        ok: true,
-        signedUrl: signed.signedUrl,
-      });
+    // 3) Gateway (optional)
+    const gatewayEnabled = isTruthyFlag(process.env.LOVABLE_AI_GATEWAY_ENABLED);
+    const gatewayBase = getValidUrlOrEmpty(process.env.LOVABLE_AI_GATEWAY_URL);
+    const gatewayKey = process.env.LOVABLE_AI_GATEWAY_KEY;
+
+    // ✅ Default: do NOT call gateway
+    if (!gatewayEnabled || !gatewayBase) {
+      return res.status(200).json({ ok: true, signedUrl: signed.signedUrl });
     }
 
-    // 4) Gateway ligado explicitamente -> chama
-    const gatewayBase = getValidGatewayBaseUrl();
+    // 4) Gateway explicitly enabled -> call
     const gatewayEndpoint = new URL("/transcribe", gatewayBase).toString();
 
     const headers = { "Content-Type": "application/json" };
-    if (LOVABLE_AI_GATEWAY_KEY) {
-      headers["Authorization"] = `Bearer ${LOVABLE_AI_GATEWAY_KEY}`;
-    }
+    if (gatewayKey) headers["Authorization"] = `Bearer ${gatewayKey}`;
 
     const gatewayResp = await fetch(gatewayEndpoint, {
       method: "POST",
@@ -202,7 +214,7 @@ app.post("/transcribe", async (req, res) => {
       console.error("Gateway error:", gatewayResp.status, gatewayJson);
 
       try {
-        await supabaseAdmin
+        await cfg.supabaseAdmin
           .from("transcription_requests")
           .update({
             status: "failed",
@@ -220,7 +232,7 @@ app.post("/transcribe", async (req, res) => {
 
     // 5) Persistir resultado (se tabela existir)
     try {
-      await supabaseAdmin
+      await cfg.supabaseAdmin
         .from("transcription_requests")
         .update({
           status: "done",
@@ -243,14 +255,7 @@ app.post("/transcribe", async (req, res) => {
   }
 });
 
-/**
- * Start
- */
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log("sinclin-worker listening on port", port);
-  console.log("SUPABASE_URL:", SUPABASE_URL);
-  console.log("JWKS:", jwksUrl.toString());
-  console.log("GATEWAY_ENABLED:", LOVABLE_AI_GATEWAY_ENABLED);
-  console.log("GATEWAY_URL_VALID:", !!getValidGatewayBaseUrl());
 });
