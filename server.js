@@ -11,6 +11,24 @@ function mustEnv(name) {
     throw new Error(`Missing env var: ${name}`);
   }
   return v;
+/**
+ * sinclin-worker (Cloud Run)
+ * - Validates Supabase JWT via JWKS
+ * - Creates signed URL for Supabase Storage object
+ * - Returns { ok: true, signedUrl } when gateway is disabled
+ * - Optionally calls Lovable AI Gateway only if explicitly enabled
+ */
+
+import express from "express";
+import { createClient } from "@supabase/supabase-js";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+
+// Node 18+ on Cloud Run has global fetch
+
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
 }
 
 function jsonError(res, status, message, extra = undefined) {
@@ -26,15 +44,37 @@ function jsonError(res, status, message, extra = undefined) {
  */
 const SUPABASE_URL = mustEnv("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = mustEnv("SUPABASE_SERVICE_ROLE_KEY");
-const LOVABLE_AI_GATEWAY_URL = mustEnv("LOVABLE_AI_GATEWAY_URL");
 
-// Optional
+/**
+ * Gateway (optional)
+ * Default: disabled
+ * Enable only if LOVABLE_AI_GATEWAY_ENABLED=true (or 1/yes/on)
+ */
+const LOVABLE_AI_GATEWAY_URL = (process.env.LOVABLE_AI_GATEWAY_URL || "").trim();
+const LOVABLE_AI_GATEWAY_ENABLED = /^(1|true|yes|on)$/i.test(
+  (process.env.LOVABLE_AI_GATEWAY_ENABLED || "").trim()
+);
 const LOVABLE_AI_GATEWAY_KEY = process.env.LOVABLE_AI_GATEWAY_KEY;
 
+function getValidGatewayBaseUrl() {
+  if (!LOVABLE_AI_GATEWAY_URL) return "";
+  if (LOVABLE_AI_GATEWAY_URL.includes("example.com")) return "";
+  try {
+    // valida formato
+    new URL(LOVABLE_AI_GATEWAY_URL);
+    return LOVABLE_AI_GATEWAY_URL;
+  } catch {
+    return "";
+  }
+}
+
+function shouldCallGateway() {
+  const base = getValidGatewayBaseUrl();
+  return LOVABLE_AI_GATEWAY_ENABLED && !!base;
+}
+
 // JWT validation settings
-// Issuer padrão do Supabase: `${SUPABASE_URL}/auth/v1`
 const expectedIssuer = new URL("/auth/v1", SUPABASE_URL).toString().replace(/\/$/, "");
-// Audience típica do Supabase: "authenticated"
 const expectedAudience = process.env.SUPABASE_JWT_AUD || "authenticated";
 
 // JWKS endpoint do Supabase Auth
@@ -61,8 +101,8 @@ async function requireSupabaseJWT(req) {
       issuer: expectedIssuer,
       audience: expectedAudience,
     });
-    return payload; // payload.sub é o uid
-  } catch (e) {
+    return payload;
+  } catch {
     const err = new Error("Invalid JWT");
     err.status = 401;
     throw err;
@@ -73,28 +113,13 @@ async function requireSupabaseJWT(req) {
  * App
  */
 const app = express();
-
-// IMPORTANTE: nada de payload enorme (sem base64)
-// Mantém a API segura contra requests gigantes.
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/", (req, res) => res.status(200).send("sinclin-worker ok"));
-
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
 /**
  * POST /transcribe
- *
- * Headers:
- *  Authorization: Bearer <JWT Supabase>
- *
- * Body:
- * {
- *   "transcription_request_id": "...",
- *   "storage_bucket": "audio",
- *   "storage_path": "users/uid/file.webm",
- *   "mime_type": "audio/webm"
- * }
  */
 app.post("/transcribe", async (req, res) => {
   try {
@@ -105,59 +130,49 @@ app.post("/transcribe", async (req, res) => {
       return jsonError(res, 401, "JWT missing sub (user id)");
     }
 
-    const {
-      transcription_request_id,
-      storage_bucket,
-      storage_path,
-      mime_type,
-    } = req.body || {};
+    const { transcription_request_id, storage_bucket, storage_path, mime_type } =
+      req.body || {};
 
-    if (
-      !transcription_request_id ||
-      !storage_bucket ||
-      !storage_path ||
-      !mime_type
-    ) {
+    if (!transcription_request_id || !storage_bucket || !storage_path || !mime_type) {
       return jsonError(res, 400, "Missing required fields", {
         required: ["transcription_request_id", "storage_bucket", "storage_path", "mime_type"],
       });
     }
 
-    // 1) Signed URL do Storage (download do áudio, sem base64)
-    const { data: signed, error: signErr } = await supabaseAdmin
-      .storage
+    // 1) Signed URL do Storage
+    const { data: signed, error: signErr } = await supabaseAdmin.storage
       .from(storage_bucket)
-      .createSignedUrl(storage_path, 60 * 60); // 1 hora
+      .createSignedUrl(storage_path, 60 * 60);
 
     if (signErr || !signed?.signedUrl) {
       console.error("Signed URL error:", signErr);
       return jsonError(res, 500, "Failed to create signed URL");
     }
 
-    // 2) Opcional: marcar status no DB (se a tabela existir)
-    // Recomendação de tabela: transcription_requests
-    // Campos sugeridos: id (text/uuid), user_id, status, input_json, result_json, error_json, updated_at
+    // 2) Opcional: marcar status no DB
     try {
-      await supabaseAdmin
-        .from("transcription_requests")
-        .upsert({
-          id: transcription_request_id,
-          user_id: userId,
-          status: "processing",
-          input_json: {
-            storage_bucket,
-            storage_path,
-            mime_type,
-          },
-          updated_at: new Date().toISOString(),
-        });
+      await supabaseAdmin.from("transcription_requests").upsert({
+        id: transcription_request_id,
+        user_id: userId,
+        status: "processing",
+        input_json: { storage_bucket, storage_path, mime_type },
+        updated_at: new Date().toISOString(),
+      });
     } catch (dbErr) {
-      // Não bloqueia se tabela não existir ainda
       console.warn("DB upsert skipped/failed:", dbErr?.message || dbErr);
     }
 
-    // 3) Chamar Lovable AI Gateway
-    const gatewayEndpoint = new URL("/transcribe", LOVABLE_AI_GATEWAY_URL).toString();
+    // ✅ 3) Se gateway estiver DESLIGADO, retorna agora (objetivo do teste)
+    if (!shouldCallGateway()) {
+      return res.status(200).json({
+        ok: true,
+        signedUrl: signed.signedUrl,
+      });
+    }
+
+    // 4) Gateway ligado explicitamente -> chama
+    const gatewayBase = getValidGatewayBaseUrl();
+    const gatewayEndpoint = new URL("/transcribe", gatewayBase).toString();
 
     const headers = { "Content-Type": "application/json" };
     if (LOVABLE_AI_GATEWAY_KEY) {
@@ -203,7 +218,7 @@ app.post("/transcribe", async (req, res) => {
       });
     }
 
-    // 4) Persistir resultado (se tabela existir)
+    // 5) Persistir resultado (se tabela existir)
     try {
       await supabaseAdmin
         .from("transcription_requests")
@@ -219,6 +234,7 @@ app.post("/transcribe", async (req, res) => {
       ok: true,
       transcription_request_id,
       result: gatewayJson,
+      signedUrl: signed.signedUrl,
     });
   } catch (e) {
     const status = e?.status || 500;
@@ -235,4 +251,6 @@ app.listen(port, () => {
   console.log("sinclin-worker listening on port", port);
   console.log("SUPABASE_URL:", SUPABASE_URL);
   console.log("JWKS:", jwksUrl.toString());
+  console.log("GATEWAY_ENABLED:", LOVABLE_AI_GATEWAY_ENABLED);
+  console.log("GATEWAY_URL_VALID:", !!getValidGatewayBaseUrl());
 });
